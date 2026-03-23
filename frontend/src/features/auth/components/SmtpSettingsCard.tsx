@@ -37,7 +37,7 @@ const toFormValues = (config?: SmtpConfigSchema): SmtpFormValues => {
   return {
     enabled: config.enabled,
     host: config.host,
-    port: config.port,
+    port: config.port as 25 | 465 | 587 | 2525,
     username: config.username,
     password: undefined,
     senderEmail: config.senderEmail,
@@ -205,18 +205,23 @@ export function SmtpSettingsCard({ config, isLoading, isUpdating, onSave }: Smtp
               <FormField
                 id="smtp-port"
                 label="Port number"
-                description="Port used by your SMTP server. Common ports include 465 and 587."
+                description="Allowed ports: 25, 465 (implicit TLS), 587 (STARTTLS), 2525."
                 error={form.formState.errors.port?.message}
               >
-                <Input
+                <select
                   id="smtp-port"
-                  type="number"
-                  min="1"
-                  max="65535"
-                  placeholder="587"
                   {...form.register('port', { valueAsNumber: true })}
-                  className={form.formState.errors.port ? 'border-destructive' : ''}
-                />
+                  className={`flex h-9 w-full rounded-md border bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus:border-primary focus:outline-none ${
+                    form.formState.errors.port
+                      ? 'border-destructive'
+                      : 'border-input'
+                  }`}
+                >
+                  <option value={587}>587 (STARTTLS)</option>
+                  <option value={465}>465 (Implicit TLS)</option>
+                  <option value={25}>25</option>
+                  <option value={2525}>2525</option>
+                </select>
               </FormField>
 
               <FormField

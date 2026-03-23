@@ -133,6 +133,9 @@ export function EmailTemplateCard({
   };
 
   const handleBack = () => {
+    if (isDirty && !window.confirm('You have unsaved changes. Discard them?')) {
+      return;
+    }
     setSelectedType(null);
     setIsDirty(false);
   };
@@ -291,7 +294,10 @@ export function EmailTemplateCard({
                 {v.description.toLowerCase()}
                 {i < variables.length - 1 ? ', ' : '.'}
               </span>
-            ))}
+            ))}{' '}
+            Avoid{' '}
+            <code className="font-mono text-xs text-foreground">&lt;script&gt;</code> tags and
+            inline event handlers — most email clients strip or block them.
           </p>
         )}
       </div>

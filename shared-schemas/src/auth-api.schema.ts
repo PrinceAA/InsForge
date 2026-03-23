@@ -385,7 +385,9 @@ export const getPublicAuthConfigResponseSchema = z.object({
 export const upsertSmtpConfigRequestSchema = z.object({
   enabled: z.boolean(),
   host: z.string().min(1, 'SMTP host is required'),
-  port: z.number().int().min(1).max(65535),
+  port: z.union([z.literal(25), z.literal(465), z.literal(587), z.literal(2525)], {
+    errorMap: () => ({ message: 'Port must be one of: 25, 465, 587, 2525' }),
+  }),
   username: z.string().min(1, 'SMTP username is required'),
   password: z.string().min(1, 'SMTP password is required').optional(),
   senderEmail: z.string().email('Invalid sender email'),

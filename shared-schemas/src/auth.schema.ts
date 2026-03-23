@@ -114,7 +114,7 @@ export const smtpConfigSchema = z.object({
   id: z.string().uuid(),
   enabled: z.boolean(),
   host: z.string(),
-  port: z.number().int().min(1).max(65535),
+  port: z.number().int(),
   username: z.string(),
   hasPassword: z.boolean(), // Never expose actual password
   senderEmail: z.string(),

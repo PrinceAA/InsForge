@@ -13,20 +13,24 @@ const ALLOWED_SMTP_PORTS = [25, 465, 587, 2525];
 /**
  * Check if an IP address is private, loopback, or link-local (RFC 1918 / RFC 4193)
  */
-function isPrivateIp(ip: string): boolean {
+export function isPrivateIp(ip: string): boolean {
   const lower = ip.toLowerCase();
-  // IPv4: loopback, private, link-local, unspecified
+  // IPv4: loopback, private, link-local, CGNAT (100.64/10), unspecified
   if (/^(127\.|10\.|192\.168\.|169\.254\.|0\.0\.0\.0)/.test(ip)) {
     return true;
   }
   if (/^172\.(1[6-9]|2\d|3[01])\./.test(ip)) {
     return true;
   }
-  // IPv6: loopback, unspecified, link-local (fe80:), unique local (fc/fd)
+  // CGNAT / shared address space (100.64.0.0/10)
+  if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(ip)) {
+    return true;
+  }
+  // IPv6: loopback, unspecified, link-local (fe80::/10), site-local (fec0::/10), unique local (fc/fd)
   if (lower === '::1' || lower === '::') {
     return true;
   }
-  if (/^(fe80:|f[cd])/.test(lower)) {
+  if (/^(fe[89ab]|fec|fed|fee|fef|f[cd])/i.test(lower)) {
     return true;
   }
   return false;
@@ -211,12 +215,21 @@ export class SmtpConfigService {
       );
 
       if (!existingResult.rows.length) {
-        await client.query('ROLLBACK');
-        throw new AppError(
-          'SMTP configuration not found. Please run migrations.',
-          500,
-          ERROR_CODES.INTERNAL_ERROR
+        // Auto-insert default singleton row if missing (e.g. migration not yet run)
+        const insertResult = await client.query(
+          `INSERT INTO auth.smtp_configs DEFAULT VALUES
+           ON CONFLICT DO NOTHING
+           RETURNING id, password_encrypted`
         );
+        if (insertResult.rows.length) {
+          existingResult.rows = insertResult.rows;
+        } else {
+          // Race condition: another connection inserted — re-fetch
+          const refetch = await client.query(
+            'SELECT id, password_encrypted FROM auth.smtp_configs LIMIT 1 FOR UPDATE'
+          );
+          existingResult.rows = refetch.rows;
+        }
       }
 
       const existingRow = existingResult.rows[0];
@@ -227,10 +240,10 @@ export class SmtpConfigService {
         passwordEncrypted = EncryptionManager.encrypt(input.password);
       }
 
-      // Validate SMTP host and port before connecting (SSRF prevention)
-      if (input.enabled) {
+      // Validate SMTP host and port unconditionally when provided (SSRF prevention)
+      // This prevents persisting dangerous hosts even when SMTP is disabled
+      if (input.host) {
         if (!ALLOWED_SMTP_PORTS.includes(input.port)) {
-          await client.query('ROLLBACK');
           throw new AppError(
             `Invalid SMTP port: ${input.port}. Allowed ports: ${ALLOWED_SMTP_PORTS.join(', ')}`,
             400,
@@ -244,7 +257,6 @@ export class SmtpConfigService {
           const allAddresses = [...addresses, ...addresses6];
           const privateAddr = allAddresses.find(isPrivateIp);
           if (privateAddr) {
-            await client.query('ROLLBACK');
             throw new AppError(
               'SMTP host resolves to a private or loopback address, which is not allowed',
               400,
@@ -259,14 +271,13 @@ export class SmtpConfigService {
         }
       }
 
-      // Validate SMTP connection before persisting
+      // Validate SMTP connection before persisting (only when enabling)
       if (input.enabled) {
         const passwordToVerify = input.password
           ? input.password
           : (this.getDecryptedPassword(existingRow.password_encrypted) ?? '');
 
         if (!passwordToVerify) {
-          await client.query('ROLLBACK');
           throw new AppError(
             'SMTP password is required when enabling SMTP',
             400,
@@ -289,7 +300,6 @@ export class SmtpConfigService {
           await transporter.verify();
           transporter.close();
         } catch (verifyError) {
-          await client.query('ROLLBACK');
           const message =
             verifyError instanceof Error ? verifyError.message : 'Unknown connection error';
           logger.error('SMTP connection verification failed', {

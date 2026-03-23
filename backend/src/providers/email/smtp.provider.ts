@@ -69,7 +69,18 @@ export class SmtpEmailProvider implements EmailProvider {
   private renderTemplate(template: string, variables: Record<string, string>): string {
     let rendered = template;
     for (const [key, value] of Object.entries(variables)) {
-      const safeValue = key === 'link' ? value : escapeHtml(value);
+      let safeValue: string;
+      if (key === 'link') {
+        // Only allow http(s) URLs in href to prevent javascript: injection
+        if (!/^https?:\/\//i.test(value)) {
+          logger.error('Rejected non-HTTP link value in email template', { key });
+          safeValue = '#';
+        } else {
+          safeValue = value;
+        }
+      } else {
+        safeValue = escapeHtml(value);
+      }
       // Match {{ key }} with optional whitespace inside braces
       const pattern = new RegExp(`\\{\\{\\s*${escapeRegex(key)}\\s*\\}\\}`, 'g');
       rendered = rendered.replace(pattern, safeValue);
