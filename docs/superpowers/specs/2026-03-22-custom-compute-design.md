@@ -572,6 +572,8 @@ Slide-out panel showing streaming build output: clone → detect → install →
 
 ## Infrastructure Scaling Path
 
+### Compute Scaling
+
 | Stage                | When              | Migration Effort       |
 | -------------------- | ----------------- | ---------------------- |
 | ECS Fargate          | Now, < 100 containers | —                  |
@@ -579,6 +581,28 @@ Slide-out panel showing streaming build output: clone → detect → install →
 | EKS                  | 500+ or need K8s features | Significant (K8s manifests) |
 
 Fargate → ECS on EC2 is a config change, same API. EKS is the big jump, only justified for GPU workloads, service mesh, or complex multi-container networking.
+
+### Routing Scaling
+
+| Stage | When | How |
+| ----- | ---- | --- |
+| ALB host-based rules | Phase 1, < 100 containers | One ALB rule per container. Simple, no extra infra. |
+| Traefik reverse proxy | 100+ containers or custom domains at scale | Replace ALB routing with Traefik. Reads routes from DB/API, no rule limits, auto-SSL via Let's Encrypt for custom domains. |
+
+**Why Traefik over other proxies:**
+- Simplest to operate — single container, zero config files
+- Native Docker/ECS provider — auto-discovers containers
+- Built-in Let's Encrypt — auto-SSL for custom domains without extra tooling
+- Dynamic routing — add/remove routes via API, no reloads
+- Dashboard included — visual route monitoring
+
+**Migration path:** When moving to Traefik, the change is transparent to customers. Containers, URLs, and DNS stay the same. The ALB still terminates TLS for the default `*.compute.insforge.app` wildcard. Traefik sits behind the ALB (or replaces it) and handles host→container routing from a lookup table (Postgres or Redis-backed).
+
+**Alternatives considered:**
+- Envoy + xDS control plane — more powerful but requires building a separate control plane service
+- OpenResty + Lua — very flexible but Lua scripting adds maintenance burden
+- Caddy — good auto-SSL but weaker dynamic config story than Traefik
+- Nginx — static config requires reloads; Nginx Plus (dynamic) is paid
 
 ## Pricing Model
 
