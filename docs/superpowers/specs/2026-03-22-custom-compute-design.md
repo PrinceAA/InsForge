@@ -76,6 +76,91 @@ Set up once before any customer deploys. Done via CDK, Terraform, or manually:
 - CodeBuild project
 - VPC / subnets / security groups
 - Route53 wildcard record (`*.compute.insforge.app` → ALB)
+- ECS task execution role (pull ECR images, write CloudWatch Logs)
+- IAM policy for the InsForge backend (see Required IAM Policy below)
+
+### Required IAM Policy
+
+The self-hosted user's `COMPUTE_AWS_ACCESS_KEY_ID` must have these permissions:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ECS",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:RegisterTaskDefinition",
+        "ecs:DeregisterTaskDefinition",
+        "ecs:CreateService",
+        "ecs:UpdateService",
+        "ecs:DeleteService",
+        "ecs:DescribeServices",
+        "ecs:DescribeTasks",
+        "ecs:ListTasks"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ECR",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:GetAuthorizationToken",
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:PutImage",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload",
+        "ecr:DescribeImages",
+        "ecr:BatchDeleteImage"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ALB",
+      "Effect": "Allow",
+      "Action": [
+        "elasticloadbalancing:CreateTargetGroup",
+        "elasticloadbalancing:DeleteTargetGroup",
+        "elasticloadbalancing:CreateRule",
+        "elasticloadbalancing:DeleteRule",
+        "elasticloadbalancing:ModifyRule",
+        "elasticloadbalancing:DescribeTargetHealth"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CodeBuild",
+      "Effect": "Allow",
+      "Action": [
+        "codebuild:StartBuild",
+        "codebuild:BatchGetBuilds",
+        "codebuild:StopBuild"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CloudWatchLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:GetLogEvents",
+        "logs:FilterLogEvents"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "PassRole",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": [
+        "arn:aws:iam::*:role/insforge-compute-task-role",
+        "arn:aws:iam::*:role/insforge-compute-execution-role"
+      ]
+    }
+  ]
+}
+```
 
 ### Request Flow
 
@@ -116,7 +201,7 @@ CREATE TABLE compute.containers (
   memory            INTEGER NOT NULL DEFAULT 512,
   port              INTEGER NOT NULL DEFAULT 8080,
   health_check_path TEXT DEFAULT '/health',
-  env_vars          JSONB DEFAULT '{}',
+  env_vars_encrypted TEXT,              -- AES-256 encrypted JSON blob via SecretService
 
   -- State
   status            TEXT NOT NULL DEFAULT 'pending'
@@ -134,8 +219,9 @@ CREATE TABLE compute.containers (
   replicas          INTEGER DEFAULT 1,
 
   -- Auto-deploy
-  auto_deploy       BOOLEAN DEFAULT true,
-  github_webhook_id TEXT,
+  auto_deploy           BOOLEAN DEFAULT true,
+  github_webhook_id     TEXT,
+  github_webhook_secret TEXT,          -- HMAC secret for verifying webhook payloads
 
   -- Custom domains (future)
   custom_domain     TEXT,
@@ -146,7 +232,11 @@ CREATE TABLE compute.containers (
   -- Metadata
   last_deployed_at  TIMESTAMPTZ,
   created_at        TIMESTAMPTZ DEFAULT now(),
-  updated_at        TIMESTAMPTZ DEFAULT now()
+  updated_at        TIMESTAMPTZ DEFAULT now(),
+
+  -- Phase 1: one container per project
+  CONSTRAINT unique_project_container UNIQUE (project_id)
+  -- Remove this constraint in Phase 2 for multiple containers
 );
 ```
 
@@ -179,17 +269,9 @@ CREATE TABLE compute.deployments (
 );
 ```
 
-### `compute.log_streams`
+### Logs
 
-```sql
-CREATE TABLE compute.log_streams (
-  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  container_id  UUID NOT NULL REFERENCES compute.containers(id),
-  log_type      TEXT CHECK (log_type IN ('build', 'runtime')),
-  log_ref       TEXT,
-  created_at    TIMESTAMPTZ DEFAULT now()
-);
-```
+Runtime logs are retrieved from CloudWatch using the ECS task ARN (deterministic log group/stream naming). Build logs come from CodeBuild's built-in log output. No separate log table needed — the references are derivable from the ECS and CodeBuild ARNs already stored.
 
 ## Backend API Routes
 
@@ -269,6 +351,8 @@ const provider = config.computeProvider === 'insforge_cloud'
 ```
 1. CLONE
    CodeBuild clones repo from GitHub (branch specified)
+   GitHub access: OAuth token stored per-project, passed to CodeBuild
+   as GITHUB_TOKEN env var override on startBuild()
 
 2. DETECT
    Dockerfile exists?
@@ -334,6 +418,12 @@ auto_deploy === true?
 
 Fetches previous deployment's image tag, skips build, goes straight to step 5. Fast redeploy (~30 seconds).
 
+**Constraints:**
+- Cannot rollback to a deployment with status `failed`
+- Exactly one deployment per container has `is_active = true` at any time
+- On successful deploy: set new deployment `is_active = true`, set previous `is_active = false`
+- ECR lifecycle policy retains last 10 images per container to ensure rollback targets exist
+
 ### Concurrent Deploy Protection
 
 If a container has a deployment with status IN (`building`, `pushing`, `deploying`), reject new deploys with "deployment already in progress."
@@ -346,6 +436,57 @@ If a container has a deployment with status IN (`building`, `pushing`, `deployin
 | Build fails         | Status: failed, build log saved, previous deployment stays live  |
 | Health check fails  | Status: failed, ECS circuit breaker rolls back automatically     |
 | Deploy timeout (10m)| Status: failed, clean up partial resources                       |
+
+### Deploy Timeout Enforcement
+
+The 10-minute timeout spanning build + deploy is enforced via EventBridge:
+1. When a deploy starts, create a scheduled EventBridge rule for `now + 10 minutes`
+2. The rule invokes a Lambda (or the backend webhook) that checks if the deployment is still in a non-terminal status
+3. If still in progress, mark as `failed` and clean up
+4. If already completed/failed, the rule is a no-op and gets cleaned up
+
+### Container Status State Machine
+
+```
+pending → building → deploying → running
+                                    ↓
+                                  stopped
+Any state → failed
+```
+
+### CodeBuild Configuration
+
+The CodeBuild project uses a parameterized buildspec. Parameters passed as environment variable overrides on `startBuild()`:
+
+- `REPO_URL` — GitHub clone URL (https with token)
+- `BRANCH` — Git branch
+- `DOCKERFILE_PATH` — Path to Dockerfile (or empty for Nixpacks)
+- `ECR_REPO` — ECR repository URI
+- `IMAGE_TAG` — Tag for the built image
+
+Buildspec steps:
+1. Clone repo using `REPO_URL` and `BRANCH`
+2. If `DOCKERFILE_PATH` is empty, install and run Nixpacks to generate Dockerfile
+3. `docker build` using Dockerfile
+4. `docker tag` and `docker push` to `ECR_REPO:IMAGE_TAG`
+
+### Fargate Resource Validation
+
+Fargate only supports specific CPU/memory combinations. The backend must validate:
+
+| CPU (units) | Valid Memory (MB)         |
+| ----------- | ------------------------ |
+| 256         | 512, 1024, 2048          |
+| 512         | 1024, 2048, 3072, 4096   |
+| 1024        | 2048, 3072, 4096, ..8192 |
+
+Reject invalid combinations at the API layer before attempting deployment.
+
+### ALB Rule Limits
+
+ALB supports max 100 listener rules (can request increase to 200). At scale, this means:
+- Phase 1 (< 100 containers): single ALB is fine
+- At scale: add additional ALBs with a Route53 weighted/latency routing layer
 
 ## Configuration
 
@@ -365,7 +506,7 @@ COMPUTE_AWS_REGION=us-east-1
 
 # Shared infra references (from one-time setup)
 COMPUTE_ECS_CLUSTER_ARN=arn:aws:ecs:...
-COMPUTE_ALB_LISTENER_ARN=arn:aws:ecs:...
+COMPUTE_ALB_LISTENER_ARN=arn:aws:elasticloadbalancing:...
 COMPUTE_ECR_REGISTRY=123456789.dkr.ecr.us-east-1.amazonaws.com
 COMPUTE_CODEBUILD_PROJECT=insforge-compute-builder
 COMPUTE_SUBNET_IDS=subnet-abc,subnet-def
@@ -373,7 +514,12 @@ COMPUTE_SECURITY_GROUP_ID=sg-123
 COMPUTE_DOMAIN=compute.insforge.app
 ```
 
-**Networking requirement:** `COMPUTE_SUBNET_IDS` and `COMPUTE_SECURITY_GROUP_ID` must be in the same VPC as the InsForge EC2 instance, so the Fargate container can reach the InsForge Postgres.
+**Networking prerequisites:**
+
+1. `COMPUTE_SUBNET_IDS` and `COMPUTE_SECURITY_GROUP_ID` must be in the same VPC as the InsForge EC2 instance
+2. Postgres must be listening on the EC2's private IP (not just `127.0.0.1`) — update Docker Compose `ports` to bind `0.0.0.0:5432:5432` or use host networking
+3. The EC2 security group must allow inbound port 5432 from the Fargate security group (or the Fargate subnet CIDR range)
+4. `INSFORGE_DB_URL` must use the EC2's private IP, not `localhost`
 
 ### Auto-Injected Into Customer Containers
 
@@ -386,7 +532,7 @@ PORT=8080
 
 ### User-Defined Env Vars
 
-Set via dashboard, stored encrypted in `compute.containers.env_vars`. Merged at deploy time. User-defined cannot override auto-injected vars.
+Set via dashboard. The JSON object (e.g., `{"STRIPE_KEY": "sk_live_..."}`) is encrypted using the existing `SecretService` (AES-256) and stored as an opaque blob in `env_vars_encrypted`. Decrypted at deploy time when building the ECS task definition. User-defined vars cannot override auto-injected vars.
 
 ### Container Contract
 
@@ -417,7 +563,7 @@ Two source modes:
 Three tabs:
 
 - **Overview**: Status, endpoint URL, source config, resource allocation, actions (Redeploy, Stop, Delete)
-- **Env Vars**: Auto-injected (read-only) and user-defined (editable). Save triggers redeploy.
+- **Env Vars**: Auto-injected (read-only) and user-defined (editable). Two actions: "Save" (stages changes) and "Save & Redeploy" (saves and triggers deploy). Confirmation dialog before redeploy.
 - **Deployments**: Chronological list of all deploys with status, trigger type, commit SHA, timing. Each entry has View Log and Rollback (for non-active deploys) actions.
 
 ### Build Log View
